@@ -17,7 +17,7 @@ A single reviewer's findings are biased by its training, prompt framing, and too
 
 ```bash
 # Clone or download into your Claude Code skills directory
-git clone https://github.com/<you>/dual-review.git ~/.claude/skills/dual-review-tmp
+git clone https://github.com/hcooch2ch3/dual-review.git ~/.claude/skills/dual-review-tmp
 mv ~/.claude/skills/dual-review-tmp/skills/dual-review ~/.claude/skills/
 rm -rf ~/.claude/skills/dual-review-tmp
 ```
