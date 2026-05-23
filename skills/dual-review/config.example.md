@@ -1,9 +1,10 @@
 ---
 # Dual Review — reviewer pin configuration (example)
 #
-# Copy this file to `config.md` in the same directory to pin reviewers
-# and skip auto-discovery. Leave keys unset (or delete `config.md`) to
-# fall back to the priority tables in SKILL.md.
+# Copy this file to `config.md` in the same directory and UNCOMMENT only
+# the keys you want to pin. All keys below are commented by default so a
+# fresh copy is inert — the skill will fall back to the priority tables
+# in SKILL.md until you opt in.
 #
 # If a pinned agent is not available on the current machine, the skill
 # falls back to discovery for that slot only and announces the
@@ -14,7 +15,7 @@
 #   oh-my-claudecode:code-reviewer
 #   superpowers:code-reviewer
 #   general-purpose
-primary: oh-my-claudecode:code-reviewer
+# primary: oh-my-claudecode:code-reviewer
 
 # Adversarial slot — approach challenger. Should differ from `primary`
 # in prompt framing or model lineage.
@@ -24,7 +25,7 @@ primary: oh-my-claudecode:code-reviewer
 #   oh-my-claudecode:architect
 #   superpowers:code-reviewer
 #   general-purpose
-adversarial: codex:adversarial-review
+# adversarial: codex:adversarial-review
 
 # Optional — only needed when `adversarial` is `codex:adversarial-review`
 # and the codex-companion entry point isn't on PATH or the default
@@ -35,11 +36,11 @@ adversarial: codex:adversarial-review
 # if they appear in the discovery priority chain or are pinned.
 # Use this to exclude agents that share a namespace with a valid
 # reviewer but serve a different purpose (rescue, setup, etc.).
-# Defaults below cover the most common confusables.
-deny:
-  - codex:rescue          # diagnosis/fix subagent, NOT a reviewer
-  - codex:setup           # interactive CLI setup, NOT a reviewer
-  - codex:codex-rescue    # alias of codex:rescue in some plugin builds
+# Uncomment if you have those plugins installed and want the safety.
+# deny:
+#   - codex:rescue          # diagnosis/fix subagent, NOT a reviewer
+#   - codex:setup           # interactive CLI setup, NOT a reviewer
+#   - codex:codex-rescue    # alias of codex:rescue in some plugin builds
 ---
 
 # Notes

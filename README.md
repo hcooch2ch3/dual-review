@@ -6,6 +6,13 @@ A Claude Code [skill](https://docs.anthropic.com/en/docs/claude-code/skills) tha
 
 A single reviewer's findings are biased by its training, prompt framing, and tool access. Two reviewers dispatched independently have largely orthogonal blind spots — the intersection is the strongest signal you'll get without paying for a senior human review.
 
+## Before you install — please read
+
+- **Output headings are Korean** (`## ✅ Accept — 양쪽 독립 합치`, etc). This is intentional: the schema is load-bearing so automation callers can parse it by literal string match. You can read English summaries in `examples/sample-brief.md`, but the headings themselves are fixed.
+- **External calls**: if you use the `codex:adversarial-review` reviewer, your reviewed code is sent to the local Codex CLI, which is a GPT-class external service. Do **not** dual-review secret-laden code with that slot active. Other reviewer paths stay inside Claude Code.
+- **Cost**: dual-review dispatches 2 reviewer agents in parallel, so expect ~2× the token spend of a single review. Wall-clock is roughly the slower of the two.
+- **See an example first**: `examples/sample-brief.md` shows what an actual synthesis brief looks like.
+
 ## Install
 
 ```bash
@@ -28,7 +35,7 @@ The skill works without `config.md` — it auto-discovers reviewers from your in
 
 ### Reviewer quality by setup
 
-The skill runs out-of-the-box on **vanilla Claude Code** (no plugins required). However, reviewer diversity — which is the whole point — improves dramatically when you install plugins that provide reviewers with different model families or prompt framings:
+The skill runs on **vanilla Claude Code**, but the diversity benefit is muted until you install at least one second-lineage reviewer. On a fresh install with no plugins, both slots resolve to `general-purpose` (the same underlying Claude model with deliberately divergent prompts) — this delivers some signal, but the orthogonal-blind-spot value proposition gets stronger as you add reviewers with different model families or prompt heuristics:
 
 | Your setup | Resolved reviewer pair | Diversity |
 |---|---|---|
@@ -73,7 +80,7 @@ dual-review-invocation:
   meta_review: false
 ```
 
-When this block is present, dual-review skips its interactive size/execution prompts. The brief schema is stable, so callers can parse it by literal string match. Designed for integration with iteration loops like `ralph-with-dual-review`.
+When this block is present, dual-review skips its interactive size/execution prompts. The brief schema is stable, so callers can parse it by literal string match. See [`examples/minimal-caller.md`](examples/minimal-caller.md) for a worked example.
 
 ## Reviewer discovery
 
