@@ -258,7 +258,18 @@ meta-verifier: <oh-my-claudecode:verifier | general-purpose | unavailable | not-
 
 ## 🔎 Meta-review notes
 - <delta>: <one line>
+
+---
+Verdict: ship | revise | block
+Rationale: <one line — why this verdict>
 ```
+
+**Verdict rules** (the synthesizer assigns; must always emit):
+- `ship` — Tier 1 empty AND Tier 2 empty AND Open Questions empty (only Tier 3 polish allowed)
+- `revise` — any Tier 1 or Tier 2 items present (fixable), OR Open Questions present (decision needed)
+- `block` — Critical-severity Tier 1 finding that invalidates the change's premise (rare)
+
+The Verdict line is **not** a `##` heading — it appears below a `---` separator at the very end so automation parsers that fail-close on unknown top-level sections won't choke. Callers that want to read it can parse the literal `Verdict:` line prefix.
 
 ### Severity normalization
 
