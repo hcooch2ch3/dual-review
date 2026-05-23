@@ -26,6 +26,19 @@ cp ~/.claude/skills/dual-review/config.example.md ~/.claude/skills/dual-review/c
 
 The skill works without `config.md` — it auto-discovers reviewers from your installed plugins and falls back to the built-in `general-purpose` agent if none are available.
 
+### Reviewer quality by setup
+
+The skill runs out-of-the-box on **vanilla Claude Code** (no plugins required). However, reviewer diversity — which is the whole point — improves dramatically when you install plugins that provide reviewers with different model families or prompt framings:
+
+| Your setup | Resolved reviewer pair | Diversity |
+|---|---|---|
+| Vanilla Claude Code | `general-purpose` × 2 (different prompts) | Minimum — both same model family |
+| `superpowers` plugin | `superpowers:code-reviewer` + `general-purpose` | Low |
+| `oh-my-claudecode` (OMC) | `oh-my-claudecode:code-reviewer` + `oh-my-claudecode:critic` | Medium — both Claude family, different framings |
+| OMC + `codex` plugins | `oh-my-claudecode:code-reviewer` + `codex:adversarial-review` | **Best** — different model lineages (Claude + GPT) |
+
+For best results, install the `oh-my-claudecode` and `codex` plugins (search your Claude Code plugin marketplace). The skill auto-detects what's available and degrades gracefully.
+
 ## Use
 
 ### Manual invocation
