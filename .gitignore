@@ -1,0 +1,12 @@
+# Local backup created by users; not for distribution
+*.bak
+
+# User-specific reviewer pins (ship config.example.md instead)
+skills/dual-review/config.md
+
+# Editors / OS
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
