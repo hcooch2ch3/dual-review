@@ -162,7 +162,7 @@ digraph dual_review {
 **Critical:** dispatch both in a single message with two tool calls. Sequential dispatch wastes wall-clock time and lets the second reviewer's framing drift toward the first.
 
 **Dispatch requirements (result-recovery contract):**
-- Dispatch every reviewer with `run_in_background: true`. The launch result returns the agent's transcript path (`output_file: …/tasks/<agentId>.output`) — you **need** that path to recover the review (Step 1.5). Foreground dispatch may not surface it.
+- Dispatch every reviewer with `run_in_background: true`. The launch result returns the agent's transcript path (`output_file: …/tasks/<agentId>.output`) — you **need** that path to recover the review (Step 1.5). Foreground dispatch may not surface it. This is independent of the skill's own `execution_mode` (§Programmatic Invocation): reviewer dispatches are **always** `run_in_background: true` even when the caller runs the skill in `execution_mode: wait`.
 - For each **Agent** slot (not the codex/Bash slot), generate a fresh short random **nonce** (e.g. 6–8 hex chars) per dispatch and inject it into the prompt's marker instruction (see Dispatch Templates). Record `(slot → agentId → output_file → nonce)` for Step 1.5.
 
 **Why this exists:** a subagent's *return value is only its last assistant message*. Harness noise (auto-reminders, hooks, task-notifications) provokes extra turns, so the real review — written in an earlier turn — is dropped from the return value. It is **not** dropped from the transcript. Step 1.5 recovers it from there. The codex/Bash slot is immune because its full stdout is captured regardless of turn count.
@@ -173,30 +173,45 @@ Do **not** trust a reviewer's returned text — it is the corrupted last message
 
 1. **Wait for completion.** Only parse a transcript after that agent's `<task-notification>` reports `status=completed`. Background dispatch returns the `output_file` path at *launch*, before the review is written — parsing early yields an incomplete transcript and a false failure.
 2. **Extract via a bounded script — never `Read`/`cat` the raw transcript** (the harness forbids it; it overflows context). Run a small `node` script over the JSONL that:
-   - keeps only `message.role == "assistant"` blocks where `content[].type == "text"`,
-   - extracts the content between the **outermost** `===BEGIN-REVIEW-<nonce>===` and `===END-REVIEW-<nonce>===` for *this slot's* nonce,
-   - prints **only** that block, truncated to a hard cap (e.g. ≤ 16 KB) so a pathological transcript can't overflow you.
+   - keeps only `message.role == "assistant"` blocks where `content[].type == "text"` (per message — do not concatenate across turns),
+   - selects the **last single assistant message** that contains exactly one `===BEGIN-REVIEW-<nonce>===` and one `===END-REVIEW-<nonce>===`, each alone on its own line, and extracts the content between them — rejecting draft/duplicate/nested-marker messages,
+   - prints **only** that block, truncated to a hard cap (~16k chars) with a `…[TRUNCATED]` sentinel so clipping is detectable.
 
-   Write this to a temp `.js` file and run `node extract.js <output_file> <nonce>` (avoids shell-escaping pitfalls). Verified working — extracts the nonce block, ignores artifact-quoted generic markers and trailing junk turns, prints `RECOVERY_FAILED` when the nonce pair is absent:
+   Write this to a temp `.js` file and run `node extract.js <output_file> <nonce>` (avoids shell-escaping pitfalls). Verified working — recovers the nonce block from a single assistant message, ignores artifact-quoted markers, draft/duplicate/nested-marker output, and trailing junk turns; prints `RECOVERY_FAILED` when no clean single pair exists:
    ```js
    const fs = require("fs"), P = process.argv[2], N = process.argv[3];
    const B = "===BEGIN-REVIEW-" + N + "===", E = "===END-REVIEW-" + N + "===";
-   let t = "";
+   // Collect assistant text blocks as SEPARATE messages (don't concatenate across turns).
+   const msgs = [];
    for (const l of fs.readFileSync(P, "utf8").split("\n")) {
      if (!l) continue;
      try {
        const m = (JSON.parse(l).message) || {};
        if (m.role !== "assistant") continue;
        const c = m.content;
-       if (Array.isArray(c)) for (const x of c) if (x.type === "text" && x.text) t += x.text + "\n";
+       let s = "";
+       if (Array.isArray(c)) { for (const x of c) if (x.type === "text" && x.text) s += x.text + "\n"; }
+       else if (typeof c === "string" && c) s = c;          // string-shaped content (harness variant)
+       if (s) msgs.push(s);
      } catch (e) {}
    }
-   const b = t.indexOf(B), e = t.lastIndexOf(E);             // outermost pair
-   if (b < 0 || e < 0 || e <= b) { console.log("RECOVERY_FAILED"); process.exit(0); }
-   console.log(t.slice(b + B.length, e).trim().slice(0, 16000));   // hard output cap
+   // Pick the LAST message holding exactly one well-formed pair, markers alone on their own lines.
+   let review = null;
+   for (const s of msgs) {
+     const lines = s.split("\n");
+     const marks = lines.filter(x => x.trim() === B || x.trim() === E);
+     if (marks.length !== 2) continue;                       // 0, or draft+final / nested → reject
+     const bi = lines.findIndex(x => x.trim() === B), ei = lines.findIndex(x => x.trim() === E);
+     if (bi < 0 || ei < 0 || ei <= bi) continue;
+     review = lines.slice(bi + 1, ei).join("\n").trim();
+   }
+   if (!review) { console.log("RECOVERY_FAILED"); process.exit(0); }
+   let out = review.slice(0, 16000);                         // hard output cap (~16k chars)
+   if (review.length > 16000) out += "\n…[TRUNCATED]";       // sentinel so clipping is detectable
+   console.log(out);
    ```
 3. **codex/Bash slot is exempt** — its `output_file` is plain stdout (not JSONL) and carries the complete review. Use it directly (channel differs only in *format*).
-4. **Completeness gate.** A recovery **succeeds** only if a `<nonce>` marker pair was found **and** the block clears a minimum length (e.g. ≥ 200 bytes). The longest-block heuristic is **not** a success path — surface it only as diagnostic context under an INVALID reviewer.
+4. **Completeness gate.** A recovery **succeeds** only if the script returned a block (not `RECOVERY_FAILED`) **and** it clears a minimum length (e.g. ≥ 200 bytes). A marker-less or malformed transcript yields `RECOVERY_FAILED` — there is no longest-block or partial-content success path; anything else is treated as failure and routed to the safety net below.
 5. **On failure (no nonce pair):** re-dispatch that slot **once** — a new dispatch gives a new `agentId`/`output_file`/`nonce`; parse the *new* transcript, not the stale one. Strengthen the retry prompt ("markers on their own lines, full review between them"). If you are down to one reviewer, escalate the retry to a *different* agent from the discovery chain when possible.
 6. **Still failing → fail closed:** mark that reviewer `INVALID`, exclude it from consensus/absence reasoning, never synthesize its junk return text as evidence, and set the synthesis header fields in §Synthesis (`Review integrity: DEGRADED_BLOCKING`). If **both** reviewers are INVALID, **hard-stop**: report total recovery failure to the user, do not emit a hollow synthesis. If exactly **one** is valid, state in the header that dual review degraded to single review (cross-consensus/Tier 1 is now impossible).
 
@@ -279,6 +294,10 @@ Agent({
 
 Brief uses **fixed Korean headings and a 3-word severity vocabulary** because automation callers parse them by literal string match. Do not rename, reorder, or invent new top-level `##` sections.
 
+**Integrity gate (fail-closed contract):** `Review integrity:` is part of the parse contract, not a decorative header.
+- **Producer:** when integrity is `DEGRADED_BLOCKING` (any reviewer INVALID, per Step 1.5), emit **empty** `## ✅ Accept` sections and route every would-be finding into `## Open Questions` prefixed `[DEGRADED]`, with a one-line blocking reason. A literal-string caller then finds **no** auto-appliable Accept items. Never populate Accept under DEGRADED_BLOCKING. If **both** reviewers are INVALID, do not emit a synthesis at all — hard-stop and report total recovery failure.
+- **Consumer:** automation callers (e.g. an iteration loop) **MUST** check `Review integrity: OK` before parsing/auto-applying any `## ✅ Accept` finding; on `DEGRADED_BLOCKING` they must abort or quarantine, not proceed. (Caller-side enforcement in a separate skill is tracked as required companion work; the producer rule above makes the output safe even for a caller that hasn't yet been updated.)
+
 ```
 # Dual Review Synthesis
 
@@ -339,12 +358,12 @@ Append `## 🔎 Meta-review notes` only when one of these triggers fires:
 2. **Caller forces it**: `meta_review: true` in the invocation block, or user passes `--meta-review`.
 3. **All three Tier buckets empty AND scope is non-trivial** (rough heuristic: > ~50 changed LOC) — suspicious no-finding case.
 
-Dispatch a meta-reviewer using the universal-floor pattern:
+The meta-reviewer is an Agent too — dispatch it `run_in_background: true` with its **own fresh nonce**, append the OUTPUT CONTRACT (Dispatch Templates §) to its prompt, and recover its notes via Step 1.5 (same last-message-loss risk). Both options below MUST carry the suffix `\n<OUTPUT CONTRACT with nonce>`.
 
-1. `oh-my-claudecode:verifier` (if available and not denied).
-2. Fallback: `Agent(subagent_type="general-purpose", description="Synthesis meta-reviewer", prompt="DO NOT re-review the code. Review the synthesis brief ONLY against the two raw reviewer outputs. Did the synthesis miss findings either reviewer raised? Are Reject reasons weak? Are Open Questions framed accurately enough for the user to decide? Emit ≤5 deltas, one line each, using the same Critical/Important/Minor vocabulary. Cite which reviewer raised each delta. Annotate only — do not rewrite the brief.")`
+1. `Agent(subagent_type="oh-my-claudecode:verifier", description="Synthesis meta-reviewer", prompt="<meta prompt below>\n<OUTPUT CONTRACT with nonce>", run_in_background: true)` (if available and not denied).
+2. Fallback: `Agent(subagent_type="general-purpose", description="Synthesis meta-reviewer", prompt="DO NOT re-review the code. Review the synthesis brief ONLY against the two raw reviewer outputs. Did the synthesis miss findings either reviewer raised? Are Reject reasons weak? Are Open Questions framed accurately enough for the user to decide? Emit ≤5 deltas, one line each, using the same Critical/Important/Minor vocabulary. Cite which reviewer raised each delta. Annotate only — do not rewrite the brief.\n<OUTPUT CONTRACT with nonce>", run_in_background: true)`
 
-The meta-reviewer is an Agent too — dispatch it `run_in_background: true` with its own nonce OUTPUT CONTRACT and recover its notes via Step 1.5 (same last-message-loss risk). Record the dispatched agent in the header (`meta-verifier: ...`). Do not recurse (no meta-meta review).
+Record the dispatched agent in the header (`meta-verifier: ...`). Do not recurse (no meta-meta review).
 
 
 ## Common Mistakes
