@@ -1,0 +1,11 @@
+{
+  "name": "dual-review",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tests for the dual-review Claude Code skill (extractor + structural lint)",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "MIT"
+}
