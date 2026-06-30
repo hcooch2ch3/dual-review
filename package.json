@@ -5,7 +5,7 @@
   "description": "Tests for the dual-review Claude Code skill (extractor + structural lint)",
   "type": "module",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/extract.test.mjs test/lint.test.mjs"
   },
   "license": "MIT"
 }

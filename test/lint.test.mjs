@@ -15,13 +15,19 @@ test('has YAML frontmatter with name + description', () => {
 });
 
 test('synthesis template carries the 4 caller-parsed headings (contract with dual-review-loop)', () => {
+  // Anchor to the actual Synthesis Template fenced block, not prose mentions —
+  // otherwise a renamed template heading stays green because the tier-mapping
+  // prose still contains the string (false-green). Require each as a full line.
+  const tpl = skill.match(/```\n(# Dual Review Synthesis[\s\S]*?)\n```/);
+  assert.ok(tpl, 'no Synthesis Template fenced block found');
+  const tplLines = tpl[1].split('\n');
   for (const h of [
     '## ✅ Accept — 양쪽 독립 합치',
     '## ✅ Accept — 단일 리뷰어, 기술적으로 타당',
     '## ❌ Reject',
     '## Open Questions',
   ]) {
-    assert.ok(skill.includes(h), `missing required heading: ${h}`);
+    assert.ok(tplLines.includes(h), `Synthesis Template missing heading line: ${h}`);
   }
 });
 
@@ -37,6 +43,8 @@ test('nonce recovery contract is wired (markers + Step 1.5)', () => {
 });
 
 test('exactly one embedded ```js extractor block (the one tests run against)', () => {
-  const count = (skill.match(/```js\b/g) || []).length;
+  // same alone-on-line predicate the extractor test uses to select the block,
+  // so the two files agree on what "the js block" is.
+  const count = skill.split('\n').filter((l) => l.trim() === '```js').length;
   assert.equal(count, 1, `expected 1 \`\`\`js block, found ${count}`);
 });

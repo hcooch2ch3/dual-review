@@ -84,10 +84,17 @@ test('T8 over-cap output is truncated with a sentinel', () => {
   assert.ok(out.length <= 16000 + 20, 'output should be capped near 16k');
 });
 
-test('T9 artifact-quoted GENERIC marker (no nonce) is ignored', () => {
-  // simulates reviewing a doc that mentions ===BEGIN-REVIEW=== generically
-  assert.equal(
-    run(jsonl([user('quotes ===BEGIN-REVIEW=== in the artifact'), asst(`${B}\nREAL\n${E}`)])),
-    'REAL',
-  );
+test('T9 a GENERIC (nonce-less) marker inside the assistant review does not split extraction', () => {
+  // the discriminating case: the marker token appears in the assistant message itself
+  // (e.g. the reviewer quotes the generic ===BEGIN-REVIEW=== while discussing it).
+  const out = run(jsonl([asst(`The artifact mentions ===BEGIN-REVIEW=== generically.\n${B}\nREAL body\n===END-REVIEW===\n${E}`)]));
+  assert.equal(out, 'REAL body\n===END-REVIEW===');
+});
+
+test('T10 real harness-shaped fixture: recovers the marked review, skips thinking + tool noise + junk turn', () => {
+  const fixture = new URL('./fixtures/real-shape.jsonl', import.meta.url);
+  const out = execFileSync('node', [scriptPath, fixture.pathname, 'fixab12'], { encoding: 'utf8' }).trim();
+  assert.match(out, /real-shape fixture finding one/);
+  assert.doesNotMatch(out, /sanitized reasoning|thinking/i, 'thinking block leaked into recovered review');
+  assert.doesNotMatch(out, /No further action needed/, 'junk return turn leaked into recovered review');
 });
