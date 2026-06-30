@@ -135,7 +135,7 @@ digraph dual_review {
     "Resolve reviewer pair\n(config.md → discovery)" [shape=box];
     "Dispatch both reviewers in parallel\n(single message, two tool calls)" [shape=box];
     "Wait for both to complete" [shape=box];
-    "Read both reports" [shape=box];
+    "Recover reviews\n(transcript / stdout)" [shape=box];
     "Categorize findings:\n• Cross-consensus\n• Unique-critical\n• Single/minor" [shape=diamond];
     "Build Tier 1/2/3 action plan" [shape=box];
     "Apply fixes" [shape=box];
@@ -146,14 +146,14 @@ digraph dual_review {
     "Identify artifact + scope" -> "Resolve reviewer pair\n(config.md → discovery)";
     "Resolve reviewer pair\n(config.md → discovery)" -> "Dispatch both reviewers in parallel\n(single message, two tool calls)";
     "Dispatch both reviewers in parallel\n(single message, two tool calls)" -> "Wait for both to complete";
-    "Wait for both to complete" -> "Read both reports";
-    "Read both reports" -> "Categorize findings:\n• Cross-consensus\n• Unique-critical\n• Single/minor";
+    "Wait for both to complete" -> "Recover reviews\n(transcript / stdout)";
+    "Recover reviews\n(transcript / stdout)" -> "Categorize findings:\n• Cross-consensus\n• Unique-critical\n• Single/minor";
     "Categorize findings:\n• Cross-consensus\n• Unique-critical\n• Single/minor" -> "Build Tier 1/2/3 action plan";
     "Build Tier 1/2/3 action plan" -> "Apply fixes";
     "Apply fixes" -> "Significant changes since review?";
     "Significant changes since review?" -> "Re-run dual review on revised artifact" [label="yes"];
     "Significant changes since review?" -> "Done" [label="no"];
-    "Re-run dual review on revised artifact" -> "Read both reports";
+    "Re-run dual review on revised artifact" -> "Recover reviews\n(transcript / stdout)";
 }
 ```
 
@@ -161,9 +161,48 @@ digraph dual_review {
 
 **Critical:** dispatch both in a single message with two tool calls. Sequential dispatch wastes wall-clock time and lets the second reviewer's framing drift toward the first.
 
+**Dispatch requirements (result-recovery contract):**
+- Dispatch every reviewer with `run_in_background: true`. The launch result returns the agent's transcript path (`output_file: …/tasks/<agentId>.output`) — you **need** that path to recover the review (Step 1.5). Foreground dispatch may not surface it.
+- For each **Agent** slot (not the codex/Bash slot), generate a fresh short random **nonce** (e.g. 6–8 hex chars) per dispatch and inject it into the prompt's marker instruction (see Dispatch Templates). Record `(slot → agentId → output_file → nonce)` for Step 1.5.
+
+**Why this exists:** a subagent's *return value is only its last assistant message*. Harness noise (auto-reminders, hooks, task-notifications) provokes extra turns, so the real review — written in an earlier turn — is dropped from the return value. It is **not** dropped from the transcript. Step 1.5 recovers it from there. The codex/Bash slot is immune because its full stdout is captured regardless of turn count.
+
+### Step 1.5 — Recover reviews (do this before reading anything)
+
+Do **not** trust a reviewer's returned text — it is the corrupted last message. Recover each review from its captured channel:
+
+1. **Wait for completion.** Only parse a transcript after that agent's `<task-notification>` reports `status=completed`. Background dispatch returns the `output_file` path at *launch*, before the review is written — parsing early yields an incomplete transcript and a false failure.
+2. **Extract via a bounded script — never `Read`/`cat` the raw transcript** (the harness forbids it; it overflows context). Run a small `node` script over the JSONL that:
+   - keeps only `message.role == "assistant"` blocks where `content[].type == "text"`,
+   - extracts the content between the **outermost** `===BEGIN-REVIEW-<nonce>===` and `===END-REVIEW-<nonce>===` for *this slot's* nonce,
+   - prints **only** that block, truncated to a hard cap (e.g. ≤ 16 KB) so a pathological transcript can't overflow you.
+
+   Write this to a temp `.js` file and run `node extract.js <output_file> <nonce>` (avoids shell-escaping pitfalls). Verified working — extracts the nonce block, ignores artifact-quoted generic markers and trailing junk turns, prints `RECOVERY_FAILED` when the nonce pair is absent:
+   ```js
+   const fs = require("fs"), P = process.argv[2], N = process.argv[3];
+   const B = "===BEGIN-REVIEW-" + N + "===", E = "===END-REVIEW-" + N + "===";
+   let t = "";
+   for (const l of fs.readFileSync(P, "utf8").split("\n")) {
+     if (!l) continue;
+     try {
+       const m = (JSON.parse(l).message) || {};
+       if (m.role !== "assistant") continue;
+       const c = m.content;
+       if (Array.isArray(c)) for (const x of c) if (x.type === "text" && x.text) t += x.text + "\n";
+     } catch (e) {}
+   }
+   const b = t.indexOf(B), e = t.lastIndexOf(E);             // outermost pair
+   if (b < 0 || e < 0 || e <= b) { console.log("RECOVERY_FAILED"); process.exit(0); }
+   console.log(t.slice(b + B.length, e).trim().slice(0, 16000));   // hard output cap
+   ```
+3. **codex/Bash slot is exempt** — its `output_file` is plain stdout (not JSONL) and carries the complete review. Use it directly (channel differs only in *format*).
+4. **Completeness gate.** A recovery **succeeds** only if a `<nonce>` marker pair was found **and** the block clears a minimum length (e.g. ≥ 200 bytes). The longest-block heuristic is **not** a success path — surface it only as diagnostic context under an INVALID reviewer.
+5. **On failure (no nonce pair):** re-dispatch that slot **once** — a new dispatch gives a new `agentId`/`output_file`/`nonce`; parse the *new* transcript, not the stale one. Strengthen the retry prompt ("markers on their own lines, full review between them"). If you are down to one reviewer, escalate the retry to a *different* agent from the discovery chain when possible.
+6. **Still failing → fail closed:** mark that reviewer `INVALID`, exclude it from consensus/absence reasoning, never synthesize its junk return text as evidence, and set the synthesis header fields in §Synthesis (`Review integrity: DEGRADED_BLOCKING`). If **both** reviewers are INVALID, **hard-stop**: report total recovery failure to the user, do not emit a hollow synthesis. If exactly **one** is valid, state in the header that dual review degraded to single review (cross-consensus/Tier 1 is now impossible).
+
 ### Step 2 — Categorize, don't summarize
 
-When both reports return, do not paraphrase each one in turn. Instead, build this table:
+Once both reviews are recovered (Step 1.5), do not paraphrase each one in turn. Instead, build this table:
 
 | Issue | Reviewer A | Reviewer B | Tier |
 |---|---|---|---|
@@ -189,20 +228,26 @@ If you made structural changes (new sections, renamed types, reworked flow), re-
 
 ### When the resolved agent is a subagent (most cases)
 
+Every Agent prompt must end with the **output contract** (with this slot's nonce substituted) so Step 1.5 can recover it:
+
+> `OUTPUT CONTRACT: emit your COMPLETE final review as one chat message, beginning with a line ===BEGIN-REVIEW-<nonce>=== and ending with a line ===END-REVIEW-<nonce>===, every finding between them. No file needed; your normal message is enough. Your returned/last message alone is NOT how this is read — the marked block is extracted from your transcript.`
+
 ```
 Agent({
   subagent_type: "<resolved primary agent>",
-  prompt: "Review <artifact path> against <spec path>. Focus on: code/spec quality, framework idioms, type safety, test meaningfulness. Cite file:line. Severity: Critical/Important/Minor.",
+  prompt: "Review <artifact path> against <spec path>. Focus on: code/spec quality, framework idioms, type safety, test meaningfulness. Cite file:line. Severity: Critical/Important/Minor.\n<OUTPUT CONTRACT with nonce>",
   run_in_background: true
 })
 Agent({
   subagent_type: "<resolved adversarial agent>",
-  prompt: "Adversarial review of <artifact path>. Challenge the fundamental approach. Surface no-ship issues. Question platform/API assumptions. Severity: Critical/Important/Minor.",
+  prompt: "Adversarial review of <artifact path>. Challenge the fundamental approach. Surface no-ship issues. Question platform/API assumptions. Severity: Critical/Important/Minor.\n<OUTPUT CONTRACT with nonce>",
   run_in_background: true
 })
 ```
 
 ### When the resolved adversarial slot is `codex:adversarial-review`
+
+No nonce/marker needed — codex writes its complete review to stdout (captured in full at `output_file`), so Step 1.5 reads it directly. Do not apply the marker completeness gate to this slot.
 
 ```
 Bash({
@@ -213,19 +258,19 @@ Bash({
 
 ### Universal floor (no plugins available)
 
-Use this when both slots resolve to `general-purpose`. The framing prompts MUST be deliberately divergent.
+Use this when both slots resolve to `general-purpose`. The framing prompts MUST be deliberately divergent. Both still carry the per-slot nonce OUTPUT CONTRACT (above) so Step 1.5 can recover them.
 
 ```
 Agent({
   subagent_type: "general-purpose",
   description: "Primary code/spec reviewer",
-  prompt: "Act as a senior code reviewer. Review <artifact>. Focus on: framework idioms, type safety, edge cases, test meaningfulness, file/line citations. Output: numbered issues with severity Critical/Important/Minor. Be specific and concrete.",
+  prompt: "Act as a senior code reviewer. Review <artifact>. Focus on: framework idioms, type safety, edge cases, test meaningfulness, file/line citations. Output: numbered issues with severity Critical/Important/Minor. Be specific and concrete.\n<OUTPUT CONTRACT with nonce>",
   run_in_background: true
 })
 Agent({
   subagent_type: "general-purpose",
   description: "Adversarial reviewer",
-  prompt: "Act as an adversarial critic. Assume the author is wrong about the core approach. For <artifact>: (1) what is the no-ship issue, (2) what platform/API/scaling assumption is unverified, (3) what would a hostile reviewer at a senior design review say. Output: numbered issues with severity. Do not echo the author's framing.",
+  prompt: "Act as an adversarial critic. Assume the author is wrong about the core approach. For <artifact>: (1) what is the no-ship issue, (2) what platform/API/scaling assumption is unverified, (3) what would a hostile reviewer at a senior design review say. Output: numbered issues with severity. Do not echo the author's framing.\n<OUTPUT CONTRACT with nonce>",
   run_in_background: true
 })
 ```
@@ -238,8 +283,9 @@ Brief uses **fixed Korean headings and a 3-word severity vocabulary** because au
 # Dual Review Synthesis
 
 Invoked by: <caller | "user"> (mode: <programmatic | interactive>)
-Reviewer A: <name> (<pinned | auto>)
-Reviewer B: <name> (<pinned | auto>)
+Review integrity: <OK | DEGRADED_BLOCKING>
+Reviewer A: <name> (<pinned | auto>) [<recovered: marker | stdout> | INVALID (recovery failed — excluded)]
+Reviewer B: <name> (<pinned | auto>) [<recovered: marker | stdout> | INVALID (recovery failed — excluded)]
 meta-verifier: <oh-my-claudecode:verifier | general-purpose | unavailable | not-fired>
 
 ## ✅ Accept — 양쪽 독립 합치
@@ -298,7 +344,7 @@ Dispatch a meta-reviewer using the universal-floor pattern:
 1. `oh-my-claudecode:verifier` (if available and not denied).
 2. Fallback: `Agent(subagent_type="general-purpose", description="Synthesis meta-reviewer", prompt="DO NOT re-review the code. Review the synthesis brief ONLY against the two raw reviewer outputs. Did the synthesis miss findings either reviewer raised? Are Reject reasons weak? Are Open Questions framed accurately enough for the user to decide? Emit ≤5 deltas, one line each, using the same Critical/Important/Minor vocabulary. Cite which reviewer raised each delta. Annotate only — do not rewrite the brief.")`
 
-Record the dispatched agent in the header (`meta-verifier: ...`). Do not recurse (no meta-meta review).
+The meta-reviewer is an Agent too — dispatch it `run_in_background: true` with its own nonce OUTPUT CONTRACT and recover its notes via Step 1.5 (same last-message-loss risk). Record the dispatched agent in the header (`meta-verifier: ...`). Do not recurse (no meta-meta review).
 
 
 ## Common Mistakes
@@ -311,6 +357,8 @@ Record the dispatched agent in the header (`meta-verifier: ...`). Do not recurse
 | Filling both slots with the same agent + same prompt | Correlated output, no orthogonal blind spots | Use different agents OR same agent with deliberately different framing prompts |
 | Skipping re-review after structural rewrite | New issues introduced by the rewrite ship unreviewed | Re-run on revised artifact |
 | Counting reviewer hallucinations as Tier 1 | Both reviewers can wrongly agree on something that isn't true | Spot-check the cited file/line before fixing |
+| Trusting an Agent reviewer's returned/last message | It's only the last assistant turn; harness noise drops the real review from the return value | Recover from the transcript via Step 1.5 (nonce marker), never synthesize the return text |
+| Parsing a transcript before the agent completes | Background dispatch returns the path at launch; early parse sees no review → false INVALID | Gate Step 1.5 on the `status=completed` task-notification |
 | Hardcoding agent names in prompts when sharing the skill | Skill breaks on machines without those plugins | Use Reviewer Discovery; concrete names live in the priority table only |
 
 ## Real-World Impact
