@@ -296,7 +296,7 @@ Brief uses **fixed Korean headings and a 3-word severity vocabulary** because au
 
 **Integrity gate (fail-closed contract):** `Review integrity:` is part of the parse contract, not a decorative header.
 - **Producer:** when integrity is `DEGRADED_BLOCKING` (any reviewer INVALID, per Step 1.5), emit **empty** `## ✅ Accept` sections and route every would-be finding into `## Open Questions` prefixed `[DEGRADED]`, with a one-line blocking reason. A literal-string caller then finds **no** auto-appliable Accept items. Never populate Accept under DEGRADED_BLOCKING. If **both** reviewers are INVALID, do not emit a synthesis at all — hard-stop and report total recovery failure.
-- **Consumer:** automation callers (e.g. an iteration loop) **MUST** check `Review integrity: OK` before parsing/auto-applying any `## ✅ Accept` finding; on `DEGRADED_BLOCKING` they must abort or quarantine, not proceed. (Caller-side enforcement in a separate skill is tracked as required companion work; the producer rule above makes the output safe even for a caller that hasn't yet been updated.)
+- **Consumer:** the producer rule above already makes a degraded synthesis safe for an unmodified caller — Accept is empty and findings land in `## Open Questions`, so a loop that stops on Open Questions (e.g. dual-review-loop) fails closed with no parser change. As defense-in-depth a caller **SHOULD** also check `Review integrity: OK` before auto-applying Accept and abort/quarantine on `DEGRADED_BLOCKING`; that explicit gate is a nice-to-have follow-up, not a prerequisite for the fail-closed guarantee.
 
 ```
 # Dual Review Synthesis
@@ -347,6 +347,8 @@ The Tier 1/2/3 categorization (see Process Step 3) is the **internal routing** u
 - Tier 1 (cross-consensus, any severity) → `## ✅ Accept — 양쪽 독립 합치`
 - Tier 2 (unique-critical: single-reviewer Critical or Important whose reasoning holds) → `## ✅ Accept — 단일 리뷰어, 기술적으로 타당`
 - Tier 3 (single-reviewer Minor/polish) → `## ❌ Reject` with reason "deferred polish (N items): ..." (clustered)
+
+**Override:** this mapping applies only when `Review integrity: OK`. Under `DEGRADED_BLOCKING` the integrity gate (§Synthesis Template) wins — Accept sections stay empty and all findings route to `## Open Questions [DEGRADED]` regardless of tier. (A caller that stops on Open Questions — e.g. dual-review-loop — then fails closed via its existing rule, no integrity-aware parser change required.)
 
 The Common Mistakes warning ("non-overlapping findings are not low priority") applies to Tier 2, not Tier 3 — do not downgrade unique-Critical findings.
 
