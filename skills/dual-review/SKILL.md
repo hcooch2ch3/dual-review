@@ -103,6 +103,7 @@ If the artifact is a branch/PR, you may suggest the user run `/ultrareview` for 
 
 - Check the agent list in the system prompt at the start of the skill. Pick the first match per slot.
 - For the Codex slot, additionally probe availability before dispatch — if `codex:setup` reports not ready, the working dir isn't a git repo (and `git init` is undesirable), or the companion command is missing, drop to slot priority 2 in the **same** parallel-dispatch turn. Do not sequentialize.
+- **`setup` reporting ready is necessary, NOT sufficient — do not treat it as proof the slot works.** Observed 2026-09-09: with the workspace over its spend cap, `codex-companion setup --json` returned `{"ready": true, "codex": {"available": true}, "auth": {"loggedIn": true}}` while **every** `adversarial-review` call failed. `setup` checks the binary, the login and the runtime; it cannot see quota, billing, or server-side refusals. A slot that probes green and then fails is therefore normal, not exotic — so availability is settled **after** dispatch by the validity gate in Step 1.5, not here. This bullet exists to catch the cheap cases early, nothing more.
 - Announce the resolved pair in the synthesis header: `Reviewer A: <name>, Reviewer B: <name> (auto-selected)` — or `(pinned via config.md)` if the user pinned them.
 
 ### User override (`config.md`)
@@ -210,7 +211,45 @@ Do **not** trust a reviewer's returned text — it is the corrupted last message
    if (review.length > 16000) out += "\n…[TRUNCATED]";       // sentinel so clipping is detectable
    console.log(out);
    ```
-3. **codex/Bash slot is exempt** — its `output_file` is plain stdout (not JSONL) and carries the complete review. Use it directly (channel differs only in *format*).
+3. **codex/Bash slot: exempt from the NONCE recovery, not from validation.** Its `output_file` is plain stdout (not JSONL), so there is no transcript to mine and no marker pair to find — read it directly. But "readable" is not "a review", and the two are easy to confuse because a failed run still writes a well-formed-looking report:
+
+   ```
+   # Codex Adversarial Review
+
+   Codex did not return valid structured JSON.
+
+   - Parse error: You hit your spend cap set by the owner of your workspace.
+   ```
+
+   That is 512 bytes — it **clears the ≥200-byte completeness gate in item 4**, and it reads as a review with no findings. Feeding it to §Synthesis produces "Reviewer B: no material findings" for a reviewer that never ran. That is a fabricated green from the one slot the pair exists to provide, and it is indistinguishable in the brief from a genuine clean review.
+
+   **Slot-failure gate — applies to the `adversarial-review` COMPANION subcommand only.** Scope matters: `config.md` documents a second Codex channel, raw `codex exec --skip-git-repo-check`, used when the target is outside a git repo or already committed. That channel never reaches the companion's renderer and emits no verdict line, so applying this gate to it would mark **every** such review FAILED and permanently downgrade the orthogonal-lineage slot. See "raw `codex exec` is NOT covered" below.
+
+   For the companion path the test is **positional and enum-bound**, not mere presence:
+
+   > exactly one line matching `^Verdict: (approve|needs-attention)$`, within the first ~6 content lines (ignoring `[codex]` progress lines), and **before** any fenced block. No such line → the slot FAILED.
+
+   Each clause earns its place, and dropping any one reopens a hole that was demonstrated, not imagined:
+   - **Anchored + enum-bound**, because the companion emits `Verdict:` only on the structured-success path (plugin 1.0.6, `scripts/lib/render.mjs:256`; the value is enum-restricted in `schemas/review-output.schema.json`). Re-verify there rather than re-deriving from samples.
+   - **Before any fence**, because both failure wrappers echo `rawOutput` verbatim into a fenced block — so an unanchored test lets the wrapper's own echo forge a pass.
+   - **Positional**, because a wrapper that echoes the dispatch prompt back can contain the required line as quoted text. Measured: genuine companion reviews put it at content line 4; a prompt-echo forgery put it at line 7.
+   - Error phrases (`did not return valid structured JSON`, `Parse error:`, `Turn failed`) are **corroboration for the report, not the test** — a legitimate review *of parsing code* can quote `Parse error:` in its findings, and gating on that alone marks a valid review FAILED.
+
+   The reliable signal is the **absence of the thing only a completed review produces**, never the presence of words a review may legitimately discuss.
+
+   **Raw `codex exec` is NOT covered by this gate, and that is a known open gap — do not silently apply the gate to it.** Requiring the prompt to mandate a verdict line does not work: the same prompt-echo vector forges it, and measurement shows the forgery lands *earlier* (content line 7) than genuine raw-exec output (line 19), so no positional bound separates them. Until this channel has its own validated mechanism, a raw `codex exec` review must be **read by a human or by the executor with explicit skepticism** — treat an output that mentions a spend cap, quota, auth failure or a truncated turn as FAILED regardless of shape, and say in the header that this slot was not machine-validated.
+
+   **On slot failure, split by CAUSE — the observed incident was permanent, but the same wrapper carries transient failures too.**
+   - *Permanent* (`spend cap`, `quota`, `rate limit`, `401`/`403`, not-logged-in, unsupported model): do **not** retry — a second call hits the same wall. Fall back immediately.
+   - *Transient or shape* (timeout, connection reset, 5xx, a one-off malformed response): **one** retry within item 5's existing budget, then fall back. An absolute no-retry rule spends the orthogonal-lineage slot on a hiccup, which is the thing this skill exists to protect.
+
+   **The fallback is necessarily sequential** — the codex result has already landed, so it cannot join the pre-dispatch parallel turn. That is expected; do not try to satisfy §Reviewer Discovery's "same turn" rule here.
+
+   **Dispatch the substitute as a normal Agent slot**: `run_in_background: true`, a **fresh nonce**, and the OUTPUT CONTRACT (§Dispatch Templates), recovered via items 1–2. Without this the substitute has no markers, item 2 returns `RECOVERY_FAILED`, and a recoverable one-slot failure escalates into item 6's both-INVALID hard stop.
+
+   **Integrity state, stated so it cannot be guessed wrong:** a slot that failed and whose substitute recovered cleanly is `Review integrity: OK` — availability failure is not recovery failure, and writing `DEGRADED_BLOCKING` here would empty every Accept section and stall a caller loop on an ordinary codex hiccup. Only an exhausted chain reaches item 6 and INVALID. **But independence IS degraded** when the substitute shares the primary's model lineage, so say so in the header rather than implying the pair was orthogonal.
+
+   **Sanitize the announced reason.** The failure text is model- and server-controlled and the header is parsed by literal string match, so a reason containing a newline plus `Review integrity: OK` would forge the very gate this strengthens. Strip newlines, collapse whitespace, cap at ~200 chars, wrap in backticks, and prefer a normalized category (`quota` / `auth` / `transient` / `protocol` / `unknown`) over raw text.
 4. **Completeness gate.** A recovery **succeeds** only if the script returned a block (not `RECOVERY_FAILED`) **and** it clears a minimum length (e.g. ≥ 200 bytes). A marker-less or malformed transcript yields `RECOVERY_FAILED` — there is no longest-block or partial-content success path; anything else is treated as failure and routed to the safety net below.
 5. **On failure (no nonce pair):** re-dispatch that slot **once** — a new dispatch gives a new `agentId`/`output_file`/`nonce`; parse the *new* transcript, not the stale one. Strengthen the retry prompt ("markers on their own lines, full review between them"). If you are down to one reviewer, escalate the retry to a *different* agent from the discovery chain when possible.
 6. **Still failing → fail closed:** mark that reviewer `INVALID`, exclude it from consensus/absence reasoning, never synthesize its junk return text as evidence, and set the synthesis header fields in §Synthesis (`Review integrity: DEGRADED_BLOCKING`). If **both** reviewers are INVALID, **hard-stop**: report total recovery failure to the user, do not emit a hollow synthesis. If exactly **one** is valid, state in the header that dual review degraded to single review (cross-consensus/Tier 1 is now impossible).
@@ -262,7 +301,7 @@ Agent({
 
 ### When the resolved adversarial slot is `codex:adversarial-review`
 
-No nonce/marker needed — codex writes its complete review to stdout (captured in full at `output_file`), so Step 1.5 reads it directly. Do not apply the marker completeness gate to this slot.
+No nonce/marker needed — codex writes its complete review to stdout (captured in full at `output_file`), so Step 1.5 reads it directly. The *marker* completeness gate (item 4) does not apply to this slot — but **the slot-failure gate in Step 1.5 item 3 is mandatory before this stdout may be used as a review.** A spend-capped run still writes a report-shaped file that clears every length check; reading it as a review reports a reviewer that never ran as "no material findings".
 
 ```
 Bash({
@@ -380,6 +419,7 @@ Record the dispatched agent in the header (`meta-verifier: ...`). Do not recurse
 | Counting reviewer hallucinations as Tier 1 | Both reviewers can wrongly agree on something that isn't true | Spot-check the cited file/line before fixing |
 | Trusting an Agent reviewer's returned/last message | It's only the last assistant turn; harness noise drops the real review from the return value | Recover from the transcript via Step 1.5 (nonce marker), never synthesize the return text |
 | Parsing a transcript before the agent completes | Background dispatch returns the path at launch; early parse sees no review → false INVALID | Gate Step 1.5 on the `status=completed` task-notification |
+| Treating a readable codex stdout as a review | A spend-capped run still writes a report-shaped file that clears every length check, so a reviewer that never ran is reported as "no material findings" | Apply the Step 1.5 item 3 slot-failure gate before using it |
 | Hardcoding agent names in prompts when sharing the skill | Skill breaks on machines without those plugins | Use Reviewer Discovery; concrete names live in the priority table only |
 
 ## Real-World Impact
