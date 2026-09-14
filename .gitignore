@@ -1,5 +1,10 @@
-# Local backup created by users; not for distribution
+# Local backups created by users; not for distribution.
+# Suffixed names like SKILL.md.bak-20260910 defeat a bare *.bak glob.
 *.bak
+*.bak-*
+
+# Local review records kept by the skill author; not for distribution
+skills/dual-review/reviews/
 
 # User-specific reviewer pins (ship config.example.md instead)
 skills/dual-review/config.md
